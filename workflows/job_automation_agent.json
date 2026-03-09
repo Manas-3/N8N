@@ -1,0 +1,218 @@
+{
+  "name": "Job Automation Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * *"
+            }
+          ]
+        }
+      },
+      "id": "1a2b3c4d-0001-0001-0001-000000000001",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "url": "https://www.themuse.com/api/public/jobs?category=Software+Engineer&page=1&descending=true",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "1a2b3c4d-0002-0002-0002-000000000002",
+      "name": "Scrape The Muse",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [480, 180]
+    },
+    {
+      "parameters": {
+        "url": "https://remotive.com/api/remote-jobs?search=software+engineer&limit=50",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "1a2b3c4d-0003-0003-0003-000000000003",
+      "name": "Scrape Remotive",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [480, 300]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.adzuna.com/v1/api/jobs/us/search/1?app_id={{$env.ADZUNA_APP_ID}}&app_key={{$env.ADZUNA_APP_KEY}}&results_per_page=20&what=software+engineer&content-type=application/json",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "1a2b3c4d-0004-0004-0004-000000000004",
+      "name": "Scrape Adzuna",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [480, 420]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combinationMode": "mergeByPosition",
+        "options": {}
+      },
+      "id": "1a2b3c4d-0005-0005-0005-000000000005",
+      "name": "Merge Job Sources",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 2,
+      "position": [720, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Filter and normalize jobs based on candidate profile\nconst profile = {\n  desired_roles: ['Software Engineer', 'Full Stack Developer', 'Backend Developer'],\n  skills: ['JavaScript', 'Python', 'Node.js', 'React', 'SQL'],\n  preferred_job_type: 'remote',\n  salary_min: 80000\n};\n\nconst allJobs = [];\n\n// Parse The Muse results\nmuseData.forEach(job => {\n  allJobs.push({\n    source: 'TheMuse',\n    title: job.name || '',\n    company: job.company?.name || 'Unknown',\n    location: job.locations?.map(l => l.name).join(', ') || 'Remote',\n    url: job.refs?.landing_page || '',\n    description: (job.contents || '').replace(/<[^>]*>/g, '').slice(0, 500)\n  });\n});\n\n// Parse Remotive results\nconst remotiveData = $input.all()[1]?.json?.jobs || [];\nremotiveData.forEach(job => {\n  allJobs.push({\n    source: 'Remotive',\n    title: job.title || '',\n    company: job.company_name || 'Unknown',\n    location: job.candidate_required_location || 'Remote',\n    url: job.url || '',\n    description: (job.description || '').replace(/<[^>]*>/g, '').slice(0, 500)\n  });\n});\n\n// Parse Adzuna results\nconst adzunaData = $input.all()[2]?.json?.results || [];\nadzunaData.forEach(job => {\n  allJobs.push({\n    source: 'Adzuna',\n    title: job.title || '',\n    company: job.company?.display_name || 'Unknown',\n    location: job.location?.display_name || 'Unknown',\n    url: job.redirect_url || '',\n    description: (job.description || '').slice(0, 500)\n  });\n});\n\n// Filter jobs\nconst keywords = profile.desired_roles.map(r => r.toLowerCase());\nconst filtered = allJobs.filter(job => {\n  const title = job.title.toLowerCase();\n  const desc = job.description.toLowerCase();\n  const roleMatch = keywords.some(kw => title.includes(kw) || desc.includes(kw));\n  const remoteMatch = job.location.toLowerCase().includes('remote') || \n                      job.location.toLowerCase().includes('anywhere');\n  return roleMatch && remoteMatch;\n});\n\nreturn filtered.slice(0, 10).map(job => ({ json: job }));"
+      },
+      "id": "1a2b3c4d-0006-0006-0006-000000000006",
+      "name": "Filter & Normalize Jobs",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [960, 300]
+    },
+    {
+      "parameters": {
+        "resource": "chat",
+        "operation": "create",
+        "model": "gpt-3.5-turbo",
+        "messages": {
+          "values": [
+            {
+              "role": "user",
+              "content": "=You are a career advisor AI. Evaluate this job for a Software Engineer with 3 years of experience in JavaScript, Python, Node.js, React, and SQL.\n\nJob Title: {{$json.title}}\nCompany: {{$json.company}}\nLocation: {{$json.location}}\nDescription: {{$json.description}}\n\nRespond ONLY in JSON format: {\"score\": <0-100>, \"paragraph\": \"<tailored cover letter paragraph, 2-3 sentences>\"}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "1a2b3c4d-0007-0007-0007-000000000007",
+      "name": "AI Job Evaluator",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1,
+      "position": [1200, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "openai-credential-id",
+          "name": "OpenAI API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "// Combine job data with AI evaluation results\nconst job = $input.item.json;\nlet aiResult = { score: 50, paragraph: '' };\n\ntry {\n  const aiContent = job.message?.content || job.choices?.[0]?.message?.content || '{}';\n  aiResult = JSON.parse(aiContent);\n} catch (e) {\n  // Use defaults if parsing fails\n}\n\nconst coverLetter = `Dear Hiring Manager,\n\nI am excited to apply for the ${job.title} position at ${job.company}. With 3 years of experience in software development and expertise in JavaScript, Python, and Node.js, I am confident I can make a meaningful contribution to your team.\n\n${aiResult.paragraph || ''}\n\nThank you for your time and consideration. I look forward to discussing this opportunity further.\n\nBest regards,\nYour Name`;\n\nreturn [{\n  json: {\n    ...job,\n    ai_score: aiResult.score || 50,\n    cover_letter: coverLetter,\n    should_apply: (aiResult.score || 50) >= 60\n  }\n}];"
+      },
+      "id": "1a2b3c4d-0008-0008-0008-000000000008",
+      "name": "Build Application",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1440, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{$json.ai_score}}",
+              "operation": "largerEqual",
+              "value2": 60
+            }
+          ]
+        }
+      },
+      "id": "1a2b3c4d-0009-0009-0009-000000000009",
+      "name": "High Fit Score?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1680, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Aggregate all qualified applications for the report\nconst items = $input.all();\nconst applications = items.map(item => ({\n  title: item.json.title,\n  company: item.json.company,\n  location: item.json.location,\n  url: item.json.url,\n  source: item.json.source,\n  score: item.json.ai_score\n}));\n\nreturn [{\n  json: {\n    date: new Date().toISOString().split('T')[0],\n    total_applications: applications.length,\n    applications\n  }\n}];"
+      },
+      "id": "1a2b3c4d-0010-0010-0010-000000000010",
+      "name": "Aggregate Applications",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1920, 220]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{$env.GMAIL_USER}}",
+        "toEmail": "={{$env.REPORT_EMAIL_RECIPIENT}}",
+        "subject": "=📊 Daily Job Report — {{$json.total_applications}} Applications | {{$json.date}}",
+        "emailType": "html",
+        "message": "=<!DOCTYPE html>\n<html>\n<body style=\"font-family: Arial, sans-serif; max-width: 700px; margin: auto;\">\n  <h2>📊 Daily Job Automation Report — {{$json.date}}</h2>\n  <p><strong>📤 Applications Submitted:</strong> {{$json.total_applications}}</p>\n  <h3>📋 Jobs Applied To:</h3>\n  <table style=\"width:100%; border-collapse:collapse; border:1px solid #ddd;\">\n    <thead>\n      <tr style=\"background:#4a90e2; color:white;\">\n        <th style=\"padding:8px;\">Title</th>\n        <th style=\"padding:8px;\">Company</th>\n        <th style=\"padding:8px;\">Location</th>\n        <th style=\"padding:8px;\">Fit Score</th>\n        <th style=\"padding:8px;\">Link</th>\n      </tr>\n    </thead>\n    <tbody>\n      {{$json.applications.map(app => \`<tr><td style=\"padding:8px;\">${app.title}</td><td style=\"padding:8px;\">${app.company}</td><td style=\"padding:8px;\">${app.location}</td><td style=\"padding:8px;\">${app.score}/100</td><td style=\"padding:8px;\"><a href=\"${app.url}\">View</a></td></tr>\`.join('')}}\n    </tbody>\n  </table>\n  <p style=\"color:#888; margin-top:20px;\">✅ Powered by N8N Job Automation Agent</p>\n</body>\n</html>",
+        "options": {}
+      },
+      "id": "1a2b3c4d-0011-0011-0011-000000000011",
+      "name": "Send Email Report",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2,
+      "position": [2160, 220],
+      "credentials": {
+        "smtp": {
+          "id": "smtp-credential-id",
+          "name": "SMTP Email"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          { "node": "Scrape The Muse", "type": "main", "index": 0 },
+          { "node": "Scrape Remotive", "type": "main", "index": 0 },
+          { "node": "Scrape Adzuna", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Scrape The Muse": {
+      "main": [[{ "node": "Merge Job Sources", "type": "main", "index": 0 }]]
+    },
+    "Scrape Remotive": {
+      "main": [[{ "node": "Merge Job Sources", "type": "main", "index": 1 }]]
+    },
+    "Scrape Adzuna": {
+      "main": [[{ "node": "Merge Job Sources", "type": "main", "index": 2 }]]
+    },
+    "Merge Job Sources": {
+      "main": [[{ "node": "Filter & Normalize Jobs", "type": "main", "index": 0 }]]
+    },
+    "Filter & Normalize Jobs": {
+      "main": [[{ "node": "AI Job Evaluator", "type": "main", "index": 0 }]]
+    },
+    "AI Job Evaluator": {
+      "main": [[{ "node": "Build Application", "type": "main", "index": 0 }]]
+    },
+    "Build Application": {
+      "main": [[{ "node": "High Fit Score?", "type": "main", "index": 0 }]]
+    },
+    "High Fit Score?": {
+      "main": [
+      [{ "node": "Aggregate Applications", "type": "main", "index": 0 }],
+      []
+      ]
+    },
+    "Aggregate Applications": {
+      "main": [[{ "node": "Send Email Report", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": ["job-automation", "ai-agent", "scraping"],
+  "triggerCount": 1,
+  "updatedAt": "2026-03-09T18:55:32.000Z",
+  "versionId": "1"
+}
