@@ -41,7 +41,6 @@ function fetchJSON(url) {
   });
 }
 
-// Source 1: Remotive
 async function scrapeRemotive() {
   try {
     const query = encodeURIComponent(profile.desired_roles[0] || 'marketing');
@@ -58,7 +57,6 @@ async function scrapeRemotive() {
   } catch (e) { log('error', `Remotive failed: ${e.message}`); return []; }
 }
 
-// Source 2: TheMuse
 async function scrapeTheMuse() {
   try {
     const query = encodeURIComponent(profile.desired_roles[0] || 'marketing');
@@ -75,7 +73,6 @@ async function scrapeTheMuse() {
   } catch (e) { log('error', `TheMuse failed: ${e.message}`); return []; }
 }
 
-// Source 3: Adzuna (UK)
 async function scrapeAdzuna() {
   const appId = process.env.ADZUNA_APP_ID;
   const appKey = process.env.ADZUNA_APP_KEY;
@@ -95,7 +92,6 @@ async function scrapeAdzuna() {
   } catch (e) { log('error', `Adzuna failed: ${e.message}`); return []; }
 }
 
-// Source 4: Jobicy - free remote jobs, no auth required
 async function scrapeJobicy() {
   try {
     const query = encodeURIComponent(profile.desired_roles[0] || 'marketing');
@@ -112,7 +108,6 @@ async function scrapeJobicy() {
   } catch (e) { log('error', `Jobicy failed: ${e.message}`); return []; }
 }
 
-// Source 5: Greenhouse - public job boards for top marketing companies, no auth required
 async function scrapeGreenhouse() {
   const companies = ['hubspot', 'canva', 'notion', 'figma', 'atlassian', 'monday', 'semrush'];
   const allJobs = [];
@@ -137,7 +132,6 @@ async function scrapeGreenhouse() {
   return allJobs;
 }
 
-// Source 6: Lever - public job boards, no auth required
 async function scrapeLever() {
   const companies = ['hotjar', 'typeform', 'contentful', 'personio', 'pendo'];
   const allJobs = [];
@@ -184,9 +178,13 @@ function generateCoverLetter(job) {
     .replace('{skills}', skillsList);
 }
 
+function sanitizeKey(val) {
+  // Filter out all non-printable ASCII characters (keeps chars 32-126 only)
+  return (val || '').split('').filter(c => c.charCodeAt(0) > 31 && c.charCodeAt(0) < 127).join('').trim();
+}
+
 async function evaluateJobWithAI(job) {
-  // Sanitize API key - strip all invisible/control characters that cause invalid header errors
-  const apiKey = (process.env.GROQ_API_KEY || '').trim().replace(/[\n\t\x00-\x1F\x7F]/g, '');
+  const apiKey = sanitizeKey(process.env.GROQ_API_KEY);
   if (!apiKey) {
     log('warn', 'GROQ_API_KEY not set - using default score');
     return { score: 70, cover_letter: generateCoverLetter(job) };
@@ -196,11 +194,7 @@ async function evaluateJobWithAI(job) {
     model: 'llama3-8b-8192',
     messages: [{
       role: 'user',
-      content: `Evaluate this job for a candidate with ${profile.experience_years} year(s) experience skilled in ${skillsList}.
-Title: ${job.title}
-Company: ${job.company}
-Desc: ${job.description.slice(0, 300)}
-Respond ONLY as JSON: {"score":<0-100>}`
+      content: 'Evaluate this job for a candidate with ' + profile.experience_years + ' year(s) experience skilled in ' + skillsList + '.\nTitle: ' + job.title + '\nCompany: ' + job.company + '\nDesc: ' + job.description.slice(0, 300) + '\nRespond ONLY as JSON: {"score":<0-100>}'
     }],
     max_tokens: 60,
     temperature: 0.2
@@ -212,7 +206,7 @@ Respond ONLY as JSON: {"score":<0-100>}`
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
+        'Authorization': 'Bearer ' + apiKey,
         'Content-Length': Buffer.byteLength(payload)
       }
     }, (res) => {
@@ -241,60 +235,10 @@ async function sendEmailReport(applications, totalScraped) {
   });
   const today = new Date().toISOString().split('T')[0];
   const sourceColors = { Remotive: '#4a90e2', TheMuse: '#e24a90', Adzuna: '#2ecc71', Jobicy: '#e2904a', Greenhouse: '#9b59b6', Lever: '#1abc9c' };
-  const rows = applications.map(app => `<tr><td style="padding:8px;">${app.title}</td><td style="padding:8px;">${app.company}</td><td style="padding:8px;">${app.location}</td><td style="padding:8px;text-align:center;"><span style="background:${sourceColors[app.source] || '#ccc'};color:white;padding:2px 8px;border-radius:10px;font-size:11px;">${app.source}</span></td><td style="padding:8px;text-align:center;"><b>${app.score}/100</b></td><td style="padding:8px;"><a href="${app.url}">View</a></td></tr>`).join('');
-  const html = `<html><body style="font-family:Arial,sans-serif;max-width:800px;margin:auto;"><div style="background:linear-gradient(135deg,#4a90e2,#7b68ee);padding:25px;border-radius:12px;color:white;text-align:center;"><h1>Daily Job Report</h1><p>${today}</p></div><p><b>Jobs Scraped:</b> ${totalScraped} | <b>Qualified Applications:</b> ${applications.length}</p><table style="width:100%;border-collapse:collapse;"><thead><tr style="background:#4a90e2;color:white;"><th style="padding:10px;">Title</th><th style="padding:10px;">Company</th><th style="padding:10px;">Location</th><th style="padding:10px;">Source</th><th style="padding:10px;">Score</th><th style="padding:10px;">Link</th></tr></thead><tbody>${rows}</tbody></table><p style="color:#aaa;font-size:12px;text-align:center;margin-top:20px;">Powered by N8N Job Automation Agent (Groq AI) | Sources: Remotive, TheMuse, Adzuna, Jobicy, Greenhouse, Lever</p></body></html>`;
+  const rows = applications.map(app => {
+    const bg = sourceColors[app.source] || '#ccc';
+    return '<tr><td style="padding:8px;">' + app.title + '</td><td style="padding:8px;">' + app.company + '</td><td style="padding:8px;">' + app.location + '</td><td style="padding:8px;text-align:center;"><span style="background:' + bg + ';color:white;padding:2px 8px;border-radius:10px;font-size:11px;">' + app.source + '</span></td><td style="padding:8px;text-align:center;"><b>' + app.score + '/100</b></td><td style="padding:8px;"><a href="' + app.url + '">View</a></td></tr>';
+  }).join('');
+  const html = '<html><body style="font-family:Arial,sans-serif;max-width:800px;margin:auto;"><div style="background:linear-gradient(135deg,#4a90e2,#7b68ee);padding:25px;border-radius:12px;color:white;text-align:center;"><h1>Daily Job Report</h1><p>' + today + '</p></div><p><b>Jobs Scraped:</b> ' + totalScraped + ' | <b>Qualified Applications:</b> ' + applications.length + '</p><table style="width:100%;border-collapse:collapse;"><thead><tr style="background:#4a90e2;color:white;"><th style="padding:10px;">Title</th><th style="padding:10px;">Company</th><th style="padding:10px;">Location</th><th style="padding:10px;">Source</th><th style="padding:10px;">Score</th><th style="padding:10px;">Link</th></tr></thead><tbody>' + rows + '</tbody></table><p style="color:#aaa;font-size:12px;text-align:center;margin-top:20px;">Powered by N8N Job Automation Agent (Groq AI) | Sources: Remotive, TheMuse, Adzuna, Jobicy, Greenhouse, Lever</p></body></html>';
   await transporter.sendMail({
-    from: `"Job Agent" <${process.env.GMAIL_USER}>`,
-    to: process.env.REPORT_EMAIL_RECIPIENT,
-    subject: `Daily Job Report - ${applications.length} Applications | ${today}`,
-    html
-  });
-  log('info', `Email sent to ${process.env.REPORT_EMAIL_RECIPIENT}`);
-}
-
-async function main() {
-  log('info', 'Job Automation Agent starting', { dry_run: DRY_RUN });
-  const [remotive, muse, adzuna, jobicy, greenhouse, lever] = await Promise.all([
-    scrapeRemotive(), scrapeTheMuse(), scrapeAdzuna(),
-    scrapeJobicy(), scrapeGreenhouse(), scrapeLever()
-  ]);
-  const allJobs = [...remotive, ...muse, ...adzuna, ...jobicy, ...greenhouse, ...lever];
-  log('info', `Total jobs scraped: ${allJobs.length}`, {
-    remotive: remotive.length, themuse: muse.length, adzuna: adzuna.length,
-    jobicy: jobicy.length, greenhouse: greenhouse.length, lever: lever.length
-  });
-  const filtered = filterJobs(allJobs);
-  log('info', `Jobs after filtering: ${filtered.length}`);
-  const minScore = profile.job_filters?.min_ai_score || 60;
-  const applications = [];
-  for (const job of filtered.slice(0, 20)) {
-    const evaluation = await evaluateJobWithAI(job);
-    if (evaluation.score >= minScore) {
-      applications.push({ ...job, score: evaluation.score, cover_letter: evaluation.cover_letter });
-      log('info', `Qualified: ${job.title} @ ${job.company} [${job.source}] (score: ${evaluation.score})`);
-    } else {
-      log('info', `Skipped: ${job.title} @ ${job.company} [${job.source}] (score: ${evaluation.score})`);
-    }
-  }
-  const report = {
-    date: new Date().toISOString(), dry_run: DRY_RUN,
-    total_scraped: allJobs.length, total_filtered: filtered.length,
-    total_applied: applications.length,
-    sources: { remotive: remotive.length, themuse: muse.length, adzuna: adzuna.length, jobicy: jobicy.length, greenhouse: greenhouse.length, lever: lever.length },
-    applications: applications.map(({ cover_letter, ...a }) => a)
-  };
-  const reportPath = path.join(REPORT_DIR, `report_${new Date().toISOString().split('T')[0]}.json`);
-  fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
-  fs.writeFileSync(path.join(REPORT_DIR, 'latest_report.json'), JSON.stringify(report, null, 2));
-  log('info', `Report saved: ${reportPath}`);
-  if (!DRY_RUN && process.env.GMAIL_USER && process.env.REPORT_EMAIL_RECIPIENT) {
-    try { await sendEmailReport(applications, allJobs.length); }
-    catch (e) { log('error', `Email failed: ${e.message}`); }
-  } else {
-    log('info', DRY_RUN ? 'Dry run: email skipped' : 'Email creds not set: skipping');
-  }
-  log('info', 'Job Automation Agent completed');
-  console.log(`\nDone! Scraped ${allJobs.length} jobs -> ${applications.length} qualified applications.`);
-}
-
-main().catch(e => { log('error', `Fatal: ${e.message}`); process.exit(1); });
+    from: '
