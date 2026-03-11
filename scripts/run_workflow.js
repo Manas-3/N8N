@@ -2,6 +2,7 @@
 /**
  * Job Automation Agent - Standalone Runner
  * Scrapes jobs, evaluates fit with AI (Groq - free), and sends a daily report email.
+ * Sources: Remotive, TheMuse, Adzuna, Jobicy, Greenhouse, Lever
  */
 
 const https = require('https');
@@ -40,9 +41,10 @@ function fetchJSON(url) {
   });
 }
 
+// Source 1: Remotive
 async function scrapeRemotive() {
   try {
-    const query = encodeURIComponent(profile.desired_roles[0] || 'software engineer');
+    const query = encodeURIComponent(profile.desired_roles[0] || 'marketing');
     const data = await fetchJSON(`https://remotive.com/api/remote-jobs?search=${query}&limit=50`);
     const jobs = (data.jobs || []).map(job => ({
       source: 'Remotive', title: job.title || '',
@@ -56,9 +58,10 @@ async function scrapeRemotive() {
   } catch (e) { log('error', `Remotive failed: ${e.message}`); return []; }
 }
 
+// Source 2: TheMuse
 async function scrapeTheMuse() {
   try {
-    const query = encodeURIComponent(profile.desired_roles[0] || 'software engineer');
+    const query = encodeURIComponent(profile.desired_roles[0] || 'marketing');
     const data = await fetchJSON(`https://www.themuse.com/api/public/jobs?category=${query}&page=1`);
     const jobs = (data.results || []).map(job => ({
       source: 'TheMuse', title: job.name || '',
@@ -72,12 +75,13 @@ async function scrapeTheMuse() {
   } catch (e) { log('error', `TheMuse failed: ${e.message}`); return []; }
 }
 
+// Source 3: Adzuna (UK)
 async function scrapeAdzuna() {
   const appId = process.env.ADZUNA_APP_ID;
   const appKey = process.env.ADZUNA_APP_KEY;
   if (!appId || !appKey) { log('warn', 'Adzuna credentials not set - skipping'); return []; }
   try {
-    const query = encodeURIComponent(profile.desired_roles[0] || 'software engineer');
+    const query = encodeURIComponent(profile.desired_roles[0] || 'marketing');
     const data = await fetchJSON(`https://api.adzuna.com/v1/api/jobs/gb/search/1?app_id=${appId}&app_key=${appKey}&results_per_page=20&what=${query}`);
     const jobs = (data.results || []).map(job => ({
       source: 'Adzuna', title: job.title || '',
@@ -89,6 +93,73 @@ async function scrapeAdzuna() {
     log('info', `Adzuna: scraped ${jobs.length} jobs`);
     return jobs;
   } catch (e) { log('error', `Adzuna failed: ${e.message}`); return []; }
+}
+
+// Source 4: Jobicy - free remote jobs, no auth required
+async function scrapeJobicy() {
+  try {
+    const query = encodeURIComponent(profile.desired_roles[0] || 'marketing');
+    const data = await fetchJSON(`https://jobicy.com/api/v2/remote-jobs?count=20&tag=${query}`);
+    const jobs = (data.jobs || []).map(job => ({
+      source: 'Jobicy', title: job.jobTitle || '',
+      company: job.companyName || 'Unknown',
+      location: job.jobGeo || 'Remote',
+      url: job.url || '',
+      description: (job.jobExcerpt || '').slice(0, 600)
+    }));
+    log('info', `Jobicy: scraped ${jobs.length} jobs`);
+    return jobs;
+  } catch (e) { log('error', `Jobicy failed: ${e.message}`); return []; }
+}
+
+// Source 5: Greenhouse - public job boards for top marketing companies, no auth required
+async function scrapeGreenhouse() {
+  const companies = ['hubspot', 'canva', 'notion', 'figma', 'atlassian', 'monday', 'semrush'];
+  const allJobs = [];
+  for (const company of companies) {
+    try {
+      const data = await fetchJSON(`https://api.greenhouse.io/v1/boards/${company}/jobs?content=true`);
+      const jobs = (data.jobs || []).filter(job => {
+        const title = (job.title || '').toLowerCase();
+        return profile.desired_roles.some(r => title.includes(r.toLowerCase().split(' ')[0]));
+      }).map(job => ({
+        source: 'Greenhouse',
+        title: job.title || '',
+        company: company.charAt(0).toUpperCase() + company.slice(1),
+        location: job.location?.name || 'Unknown',
+        url: job.absolute_url || '',
+        description: (job.content || '').replace(/<[^>]*>/g, '').slice(0, 600)
+      }));
+      allJobs.push(...jobs);
+    } catch (e) { log('warn', `Greenhouse ${company} failed: ${e.message}`); }
+  }
+  log('info', `Greenhouse: scraped ${allJobs.length} jobs`);
+  return allJobs;
+}
+
+// Source 6: Lever - public job boards, no auth required
+async function scrapeLever() {
+  const companies = ['hotjar', 'typeform', 'contentful', 'personio', 'pendo'];
+  const allJobs = [];
+  for (const company of companies) {
+    try {
+      const data = await fetchJSON(`https://api.lever.co/v0/postings/${company}?mode=json`);
+      const jobs = (Array.isArray(data) ? data : []).filter(job => {
+        const title = (job.text || '').toLowerCase();
+        return profile.desired_roles.some(r => title.includes(r.toLowerCase().split(' ')[0]));
+      }).map(job => ({
+        source: 'Lever',
+        title: job.text || '',
+        company: company.charAt(0).toUpperCase() + company.slice(1),
+        location: job.categories?.location || job.workplaceType || 'Unknown',
+        url: job.hostedUrl || '',
+        description: (job.descriptionPlain || '').slice(0, 600)
+      }));
+      allJobs.push(...jobs);
+    } catch (e) { log('warn', `Lever ${company} failed: ${e.message}`); }
+  }
+  log('info', `Lever: scraped ${allJobs.length} jobs`);
+  return allJobs;
 }
 
 function filterJobs(jobs) {
@@ -168,8 +239,9 @@ async function sendEmailReport(applications, totalScraped) {
     auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_APP_PASSWORD }
   });
   const today = new Date().toISOString().split('T')[0];
-  const rows = applications.map(app => `<tr><td style="padding:8px;">${app.title}</td><td style="padding:8px;">${app.company}</td><td style="padding:8px;">${app.location}</td><td style="padding:8px;text-align:center;"><b>${app.score}/100</b></td><td style="padding:8px;"><a href="${app.url}">View</a></td></tr>`).join('');
-  const html = `<html><body style="font-family:Arial,sans-serif;max-width:750px;margin:auto;"><div style="background:linear-gradient(135deg,#4a90e2,#7b68ee);padding:25px;border-radius:12px;color:white;text-align:center;"><h1>Daily Job Report</h1><p>${today}</p></div><p><b>Jobs Scraped:</b> ${totalScraped} | <b>Applications:</b> ${applications.length}</p><table style="width:100%;border-collapse:collapse;"><thead><tr style="background:#4a90e2;color:white;"><th style="padding:10px;">Title</th><th style="padding:10px;">Company</th><th style="padding:10px;">Location</th><th style="padding:10px;">Score</th><th style="padding:10px;">Link</th></tr></thead><tbody>${rows}</tbody></table><p style="color:#aaa;font-size:12px;text-align:center;margin-top:20px;">Powered by N8N Job Automation Agent (Groq AI)</p></body></html>`;
+  const sourceColors = { Remotive: '#4a90e2', TheMuse: '#e24a90', Adzuna: '#2ecc71', Jobicy: '#e2904a', Greenhouse: '#9b59b6', Lever: '#1abc9c' };
+  const rows = applications.map(app => `<tr><td style="padding:8px;">${app.title}</td><td style="padding:8px;">${app.company}</td><td style="padding:8px;">${app.location}</td><td style="padding:8px;text-align:center;"><span style="background:${sourceColors[app.source] || '#ccc'};color:white;padding:2px 8px;border-radius:10px;font-size:11px;">${app.source}</span></td><td style="padding:8px;text-align:center;"><b>${app.score}/100</b></td><td style="padding:8px;"><a href="${app.url}">View</a></td></tr>`).join('');
+  const html = `<html><body style="font-family:Arial,sans-serif;max-width:800px;margin:auto;"><div style="background:linear-gradient(135deg,#4a90e2,#7b68ee);padding:25px;border-radius:12px;color:white;text-align:center;"><h1>Daily Job Report</h1><p>${today}</p></div><p><b>Jobs Scraped:</b> ${totalScraped} | <b>Qualified Applications:</b> ${applications.length}</p><table style="width:100%;border-collapse:collapse;"><thead><tr style="background:#4a90e2;color:white;"><th style="padding:10px;">Title</th><th style="padding:10px;">Company</th><th style="padding:10px;">Location</th><th style="padding:10px;">Source</th><th style="padding:10px;">Score</th><th style="padding:10px;">Link</th></tr></thead><tbody>${rows}</tbody></table><p style="color:#aaa;font-size:12px;text-align:center;margin-top:20px;">Powered by N8N Job Automation Agent (Groq AI) | Sources: Remotive, TheMuse, Adzuna, Jobicy, Greenhouse, Lever</p></body></html>`;
   await transporter.sendMail({
     from: `"Job Agent" <${process.env.GMAIL_USER}>`,
     to: process.env.REPORT_EMAIL_RECIPIENT,
@@ -181,23 +253,35 @@ async function sendEmailReport(applications, totalScraped) {
 
 async function main() {
   log('info', 'Job Automation Agent starting', { dry_run: DRY_RUN });
-  const [remotive, muse, adzuna] = await Promise.all([scrapeRemotive(), scrapeTheMuse(), scrapeAdzuna()]);
-  const allJobs = [...remotive, ...muse, ...adzuna];
-  log('info', `Total jobs scraped: ${allJobs.length}`);
+  const [remotive, muse, adzuna, jobicy, greenhouse, lever] = await Promise.all([
+    scrapeRemotive(), scrapeTheMuse(), scrapeAdzuna(),
+    scrapeJobicy(), scrapeGreenhouse(), scrapeLever()
+  ]);
+  const allJobs = [...remotive, ...muse, ...adzuna, ...jobicy, ...greenhouse, ...lever];
+  log('info', `Total jobs scraped: ${allJobs.length}`, {
+    remotive: remotive.length, themuse: muse.length, adzuna: adzuna.length,
+    jobicy: jobicy.length, greenhouse: greenhouse.length, lever: lever.length
+  });
   const filtered = filterJobs(allJobs);
   log('info', `Jobs after filtering: ${filtered.length}`);
   const minScore = profile.job_filters?.min_ai_score || 60;
   const applications = [];
-  for (const job of filtered.slice(0, 15)) {
+  for (const job of filtered.slice(0, 20)) {
     const evaluation = await evaluateJobWithAI(job);
     if (evaluation.score >= minScore) {
       applications.push({ ...job, score: evaluation.score, cover_letter: evaluation.cover_letter });
-      log('info', `Qualified: ${job.title} @ ${job.company} (score: ${evaluation.score})`);
+      log('info', `Qualified: ${job.title} @ ${job.company} [${job.source}] (score: ${evaluation.score})`);
     } else {
-      log('info', `Skipped: ${job.title} @ ${job.company} (score: ${evaluation.score})`);
+      log('info', `Skipped: ${job.title} @ ${job.company} [${job.source}] (score: ${evaluation.score})`);
     }
   }
-  const report = { date: new Date().toISOString(), dry_run: DRY_RUN, total_scraped: allJobs.length, total_filtered: filtered.length, total_applied: applications.length, applications: applications.map(({ cover_letter, ...a }) => a) };
+  const report = {
+    date: new Date().toISOString(), dry_run: DRY_RUN,
+    total_scraped: allJobs.length, total_filtered: filtered.length,
+    total_applied: applications.length,
+    sources: { remotive: remotive.length, themuse: muse.length, adzuna: adzuna.length, jobicy: jobicy.length, greenhouse: greenhouse.length, lever: lever.length },
+    applications: applications.map(({ cover_letter, ...a }) => a)
+  };
   const reportPath = path.join(REPORT_DIR, `report_${new Date().toISOString().split('T')[0]}.json`);
   fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
   fs.writeFileSync(path.join(REPORT_DIR, 'latest_report.json'), JSON.stringify(report, null, 2));
@@ -209,7 +293,7 @@ async function main() {
     log('info', DRY_RUN ? 'Dry run: email skipped' : 'Email creds not set: skipping');
   }
   log('info', 'Job Automation Agent completed');
-  console.log(`\nDone! Scraped ${allJobs.length} jobs -> ${applications.length} applications submitted.`);
+  console.log(`\nDone! Scraped ${allJobs.length} jobs -> ${applications.length} qualified applications.`);
 }
 
 main().catch(e => { log('error', `Fatal: ${e.message}`); process.exit(1); });
