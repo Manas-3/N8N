@@ -21,26 +21,8 @@ const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
 
-const PROFILE_PATH = path.join(__dirname, '../config/candidate_profile.json');
-const REPORT_DIR = path.join(__dirname, '../reports');
-const LOG_DIR = path.join(__dirname, '../logs');
-
-const DRY_RUN = (process.env.DRY_RUN || 'true') === 'true';
-const GROQ_API_KEY = sanitizeApiKey(process.env.GROQ_API_KEY || '');
-const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.1-70b-versatile';
-
-// Email (SMTP-like over provider API is not implemented; uses a simple HTTPS email API pattern)
-// If you use SendGrid/Mailgun/Resend/etc., wire it here.
-const EMAIL_PROVIDER = process.env.EMAIL_PROVIDER || 'resend'; // 'resend' | 'sendgrid' | 'mailgun' | 'none'
-const EMAIL_API_KEY = (process.env.EMAIL_API_KEY || '').trim();
-const EMAIL_FROM = (process.env.EMAIL_FROM || '').trim();
-const EMAIL_TO = (process.env.EMAIL_TO || '').trim();
-
-const profile = JSON.parse(fs.readFileSync(PROFILE_PATH, 'utf8'));
-
-[REPORT_DIR, LOG_DIR].forEach((dir) => fs.mkdirSync(dir, { recursive: true }));
-
-/** ----------------------------- utilities ----------------------------- */
+// ----------------------------- utilities -----------------------------
+// FIX #1: sanitizeApiKey moved above all const declarations that call it.
 
 function sanitizeApiKey(key) {
   // Remove characters that can break HTTP headers (control chars, non-ASCII)
@@ -63,13 +45,6 @@ function ymd() {
   return new Date().toISOString().slice(0, 10);
 }
 
-function log(level, message, data = {}) {
-  const entry = { timestamp: nowIso(), level, message, ...data };
-  const line = JSON.stringify(entry);
-  console.log(line);
-  fs.appendFileSync(path.join(LOG_DIR, `run_${ymd()}.log`), line + '\n');
-}
-
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -88,7 +63,84 @@ function safeText(x, maxLen = 600) {
   return s.length > maxLen ? s.slice(0, maxLen - 1) + '…' : s;
 }
 
-function fetchJSON(url, opts = {}) {
+// ----------------------------- config --------------------------------
+
+const PROFILE_PATH = path.join(__dirname, '../config/candidate_profile.json');
+const REPORT_DIR = path.join(__dirname, '../reports');
+const LOG_DIR = path.join(__dirname, '../logs');
+
+// FIX #4: DRY_RUN now defaults to 'false'. Set DRY_RUN=true in env to suppress emails.
+const DRY_RUN = (process.env.DRY_RUN || 'false') === 'true';
+const GROQ_API_KEY = sanitizeApiKey(process.env.GROQ_API_KEY || '');
+const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.1-70b-versatile';
+
+// Email config
+const EMAIL_PROVIDER = process.env.EMAIL_PROVIDER || 'resend'; // 'resend' | 'none'
+const EMAIL_API_KEY = (process.env.EMAIL_API_KEY || '').trim();
+const EMAIL_FROM = (process.env.EMAIL_FROM || '').trim();
+const EMAIL_TO = (process.env.EMAIL_TO || '').trim();
+
+// FIX #10: Wrap directory creation — fail fast with a clear message instead of a cryptic stack trace.
+try {
+  [REPORT_DIR, LOG_DIR].forEach((dir) => fs.mkdirSync(dir, { recursive: true }));
+} catch (e) {
+  console.error(`[FATAL] Failed to create required directories: ${e.message}`);
+  process.exit(1);
+}
+
+// Seen-jobs cache path (FIX #3)
+const SEEN_JOBS_PATH = path.join(LOG_DIR, 'seen_jobs.json');
+
+// Load and validate profile
+let profile;
+try {
+  profile = JSON.parse(fs.readFileSync(PROFILE_PATH, 'utf8'));
+} catch (e) {
+  console.error(`[FATAL] Could not load candidate_profile.json: ${e.message}`);
+  process.exit(1);
+}
+
+// FIX #9: Validate required profile fields at startup so bad prompts fail loudly.
+const REQUIRED_PROFILE_FIELDS = ['name', 'location', 'desired_roles', 'skills', 'experience'];
+for (const field of REQUIRED_PROFILE_FIELDS) {
+  if (!profile[field]) {
+    console.error(`[FATAL] Missing required profile field: "${field}"`);
+    process.exit(1);
+  }
+}
+
+// FIX #7: Validate email address format at startup.
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+if (!DRY_RUN && EMAIL_PROVIDER !== 'none') {
+  if (!EMAIL_REGEX.test(EMAIL_FROM)) {
+    console.error(`[FATAL] EMAIL_FROM is missing or invalid: "${EMAIL_FROM}"`);
+    process.exit(1);
+  }
+  if (!EMAIL_REGEX.test(EMAIL_TO)) {
+    console.error(`[FATAL] EMAIL_TO is missing or invalid: "${EMAIL_TO}"`);
+    process.exit(1);
+  }
+}
+
+// ----------------------------- logging -------------------------------
+
+function log(level, message, data = {}) {
+  const entry = { timestamp: nowIso(), level, message, ...data };
+  const line = JSON.stringify(entry);
+  console.log(line);
+  fs.appendFileSync(path.join(LOG_DIR, `run_${ymd()}.log`), line + '\n');
+}
+
+if (DRY_RUN) {
+  // FIX #4: Make DRY_RUN state unmissably visible so prod misconfiguration is caught immediately.
+  log('warn', '*** DRY_RUN is active — emails will NOT be sent. Set DRY_RUN=false to enable. ***');
+}
+
+// ----------------------------- HTTP helpers --------------------------
+
+// FIX #8: fetchJSON now follows HTTP 301/302 redirects (up to maxRedirects hops).
+function fetchJSON(url, opts = {}, _redirectCount = 0) {
+  const maxRedirects = opts.maxRedirects ?? 5;
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const req = https.request(
@@ -104,6 +156,18 @@ function fetchJSON(url, opts = {}) {
         timeout: opts.timeoutMs || 15000,
       },
       (res) => {
+        // Follow redirects
+        if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+          if (_redirectCount >= maxRedirects) {
+            return reject(new Error(`Too many redirects for ${url}`));
+          }
+          // Consume response body to free socket
+          res.resume();
+          return fetchJSON(res.headers.location, opts, _redirectCount + 1)
+            .then(resolve)
+            .catch(reject);
+        }
+
         let data = '';
         res.on('data', (chunk) => (data += chunk));
         res.on('end', () => {
@@ -173,7 +237,28 @@ function postJSON(url, body, opts = {}) {
   });
 }
 
-/** ----------------------------- job sources ---------------------------- */
+// ----------------------------- seen-jobs cache (FIX #3) --------------
+
+function loadSeenJobs() {
+  try {
+    if (fs.existsSync(SEEN_JOBS_PATH)) {
+      return new Set(JSON.parse(fs.readFileSync(SEEN_JOBS_PATH, 'utf8')));
+    }
+  } catch (e) {
+    log('warn', `Could not load seen_jobs cache, starting fresh: ${e.message}`);
+  }
+  return new Set();
+}
+
+function saveSeenJobs(seenSet) {
+  try {
+    fs.writeFileSync(SEEN_JOBS_PATH, JSON.stringify([...seenSet]), 'utf8');
+  } catch (e) {
+    log('warn', `Could not save seen_jobs cache: ${e.message}`);
+  }
+}
+
+// ----------------------------- job sources ---------------------------
 
 async function scrapeRemotive() {
   try {
@@ -227,7 +312,6 @@ async function scrapeTheMuse() {
 
 async function scrapeJobicy() {
   try {
-    // Jobicy: https://jobicy.com/api/v2/remote-jobs
     const query = encodeURIComponent(profile.desired_roles?.[0] || 'marketing');
     const url = `https://jobicy.com/api/v2/remote-jobs?count=50&tag=${query}`;
     const data = await fetchJSON(url);
@@ -265,7 +349,7 @@ async function scrapeLever() {
   return [];
 }
 
-async function scrapeAllSources() {
+async function scrapeAllSources(seenUrls) {
   const all = [];
   const sources = [
     scrapeRemotive,
@@ -286,21 +370,27 @@ async function scrapeAllSources() {
     }
   }
 
-  // Basic de-dupe by URL/title/company
+  // FIX #5: Improved dedup — guard against jobs with no URL or title collapsing together.
   const seen = new Set();
   const deduped = [];
   for (const j of all) {
+    // Skip completely blank entries
+    if (!j.url && !j.title) continue;
+
     const k = `${(j.url || '').toLowerCase()}|${(j.title || '').toLowerCase()}|${(j.company || '').toLowerCase()}`;
     if (seen.has(k)) continue;
     seen.add(k);
     deduped.push(j);
   }
 
-  log('info', `Total scraped jobs: ${all.length}, deduped: ${deduped.length}`);
-  return deduped;
+  // FIX #3: Filter out jobs already processed in a previous run.
+  const newJobs = deduped.filter((j) => !j.url || !seenUrls.has(j.url));
+
+  log('info', `Total scraped: ${all.length}, deduped: ${deduped.length}, new (unseen): ${newJobs.length}`);
+  return newJobs;
 }
 
-/** ------------------------------ AI scoring ---------------------------- */
+// ----------------------------- AI scoring ----------------------------
 
 function buildPrompt(job) {
   const desired = (profile.desired_roles || []).join(', ');
@@ -365,9 +455,32 @@ async function groqChatCompletion(prompt) {
   return String(content);
 }
 
+// FIX #2: Retry wrapper with exponential backoff for Groq 429 rate-limit responses.
+async function groqChatCompletionWithRetry(prompt, retries = 3) {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      return await groqChatCompletion(prompt);
+    } catch (e) {
+      const isRateLimit = e.message.includes('429');
+      const isLastAttempt = attempt === retries - 1;
+      if (isRateLimit && !isLastAttempt) {
+        const delay = 2000 * (attempt + 1);
+        log('warn', `Groq rate-limited (429), retrying in ${delay}ms`, { attempt });
+        await sleep(delay);
+      } else {
+        throw e;
+      }
+    }
+  }
+}
+
+// FIX #11: Strip markdown code fences before JSON extraction in case the model disobeys.
 function tryParseJsonStrict(text) {
-  // Attempt to extract first JSON object in case model adds whitespace.
-  const s = String(text || '').trim();
+  const s = String(text || '')
+    .replace(/```[a-z]*\n?/gi, '') // strip opening fences like ```json
+    .replace(/```/g, '')            // strip closing fences
+    .trim();
+
   const firstBrace = s.indexOf('{');
   const lastBrace = s.lastIndexOf('}');
   if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
@@ -377,34 +490,47 @@ function tryParseJsonStrict(text) {
   return JSON.parse(jsonStr);
 }
 
-async function scoreJobsWithAI(jobs) {
+// FIX #6: Concurrent AI scoring using a small worker pool instead of serial execution.
+async function scoreJobsWithAI(jobs, concurrency = 4) {
   const scored = [];
-  for (const job of jobs) {
-    try {
-      const prompt = buildPrompt(job);
-      const raw = await groqChatCompletion(prompt);
-      const parsed = tryParseJsonStrict(raw);
+  const queue = [...jobs];
 
-      const score = Number(parsed.score);
-      if (!Number.isFinite(score)) throw new Error('AI score is not a number');
+  async function worker() {
+    while (queue.length > 0) {
+      const job = queue.shift();
+      if (!job) break;
+      try {
+        const prompt = buildPrompt(job);
+        const raw = await groqChatCompletionWithRetry(prompt);
+        const parsed = tryParseJsonStrict(raw);
 
-      scored.push({
-        ...job,
-        ai_score: score,
-        ai_reasons: Array.isArray(parsed.reasons) ? parsed.reasons.slice(0, 6) : [],
-        ai_gaps: Array.isArray(parsed.must_have_gaps) ? parsed.must_have_gaps.slice(0, 6) : [],
-      });
+        const score = Number(parsed.score);
+        if (!Number.isFinite(score)) throw new Error('AI score is not a number');
 
-      log('info', 'Scored job', { title: job.title, company: job.company, score });
-      await sleep(300);
-    } catch (e) {
-      log('error', `AI scoring failed: ${e.message}`, { title: job.title, company: job.company, source: job.source });
+        scored.push({
+          ...job,
+          ai_score: score,
+          ai_reasons: Array.isArray(parsed.reasons) ? parsed.reasons.slice(0, 6) : [],
+          ai_gaps: Array.isArray(parsed.must_have_gaps) ? parsed.must_have_gaps.slice(0, 6) : [],
+        });
+
+        log('info', 'Scored job', { title: job.title, company: job.company, score });
+      } catch (e) {
+        log('error', `AI scoring failed: ${e.message}`, {
+          title: job.title,
+          company: job.company,
+          source: job.source,
+        });
+      }
     }
   }
+
+  // Launch `concurrency` workers in parallel
+  await Promise.all(Array.from({ length: concurrency }, worker));
   return scored;
 }
 
-/** --------------------------- filtering/report ------------------------- */
+// ------------------------- filtering / report ------------------------
 
 function passesFilters(job) {
   const minScore = Number(profile.job_filters?.min_ai_score ?? 60);
@@ -489,7 +615,6 @@ function escapeHtml(s) {
 }
 
 function escapeAttr(s) {
-  // For URL attributes; still do minimal escaping
   return escapeHtml(s).replace(/`/g, '&#96;');
 }
 
@@ -504,16 +629,12 @@ function writeReportFiles(payload) {
   return { jsonPath, htmlPath };
 }
 
-/** ------------------------------ email -------------------------------- */
+// -------------------------------- email ------------------------------
 
 async function sendEmailReport(subject, html) {
   if (DRY_RUN) {
     log('info', 'DRY_RUN enabled: skipping email send', { subject });
     return { skipped: true };
-  }
-
-  if (!EMAIL_TO || !EMAIL_FROM) {
-    throw new Error('EMAIL_TO or EMAIL_FROM missing');
   }
 
   if (EMAIL_PROVIDER === 'none') {
@@ -525,7 +646,7 @@ async function sendEmailReport(subject, html) {
     throw new Error('EMAIL_API_KEY missing');
   }
 
-  // Reference implementation for Resend (simple and popular)
+  // Reference implementation for Resend
   if (EMAIL_PROVIDER === 'resend') {
     const data = await postJSON(
       'https://api.resend.com/emails',
@@ -546,17 +667,27 @@ async function sendEmailReport(subject, html) {
   throw new Error(`Unsupported EMAIL_PROVIDER: ${EMAIL_PROVIDER}`);
 }
 
-/** -------------------------------- main -------------------------------- */
+// -------------------------------- main -------------------------------
 
 async function main() {
   log('info', 'Job automation started', { dry_run: DRY_RUN });
 
-  const jobs = await scrapeAllSources();
+  // FIX #3: Load seen-jobs cache to skip already-processed listings.
+  const seenUrls = loadSeenJobs();
+  log('info', `Seen-jobs cache loaded`, { count: seenUrls.size });
+
+  const jobs = await scrapeAllSources(seenUrls);
   if (!jobs.length) {
-    log('warn', 'No jobs scraped from sources.');
+    log('warn', 'No new jobs found (all already seen or no results from sources).');
   }
 
   const scored = await scoreJobsWithAI(jobs);
+
+  // FIX #3: Persist newly seen URLs so next run skips them.
+  for (const j of scored) {
+    if (j.url) seenUrls.add(j.url);
+  }
+  saveSeenJobs(seenUrls);
 
   const filtered = scored.filter(passesFilters);
   filtered.sort((a, b) => (b.ai_score || 0) - (a.ai_score || 0));
