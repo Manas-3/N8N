@@ -1,0 +1,46 @@
+name: Daily Job Report
+
+on:
+  schedule:
+    - cron: '0 7 * * *'   # 07:00 UTC daily (adjust to your timezone)
+  workflow_dispatch:        # allows manual trigger from GitHub Actions UI
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Cache seen-jobs between runs
+        uses: actions/cache@v4
+        with:
+          path: logs/seen_jobs.json
+          key: seen-jobs-${{ runner.os }}
+          restore-keys: |
+            seen-jobs-
+
+      - name: Run job automation agent
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_MODEL: ${{ vars.GROQ_MODEL || 'llama-3.1-70b-versatile' }}
+          EMAIL_PROVIDER: resend
+          EMAIL_API_KEY: ${{ secrets.EMAIL_API_KEY }}
+          EMAIL_FROM: ${{ vars.EMAIL_FROM }}
+          EMAIL_TO: ${{ vars.EMAIL_TO }}
+          DRY_RUN: 'false'
+        run: node src/agent.js
+
+      - name: Upload report as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: job-report-${{ github.run_id }}
+          path: reports/
+          retention-days: 30
