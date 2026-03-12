@@ -1,56 +1,597 @@
-name: Job Automation Agent
+#!/usr/bin/env node
+/**
+ * Job Automation Agent - Standalone Runner
+ * Scrapes jobs, evaluates fit with AI (Groq), and sends a daily report email.
+ *
+ * Sources (implemented here):
+ * - Remotive
+ * - TheMuse
+ * - Jobicy
+ *
+ * Sources (stubs provided here, can be extended):
+ * - Adzuna (requires app_id/app_key)
+ * - Greenhouse (company boards)
+ * - Lever (company boards)
+ */
 
-on:
-  schedule:
-    - cron: '0 8 * * *'
-  workflow_dispatch:
-    inputs:
-      dry_run:
-        description: 'Dry run (no email sent)'
-        required: false
-        default: 'true'
-        type: choice
-        options:
-          - 'true'
-          - 'false'
+'use strict';
 
-jobs:
-  run-job-agent:
-    runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const { URL } = require('url');
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+const PROFILE_PATH = path.join(__dirname, '../config/candidate_profile.json');
+const REPORT_DIR = path.join(__dirname, '../reports');
+const LOG_DIR = path.join(__dirname, '../logs');
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '24'
+const DRY_RUN = (process.env.DRY_RUN || 'true') === 'true';
+const GROQ_API_KEY = sanitizeApiKey(process.env.GROQ_API_KEY || '');
+const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.1-70b-versatile';
 
-      - name: Install dependencies
-        run: npm install nodemailer
+// Email (SMTP-like over provider API is not implemented; uses a simple HTTPS email API pattern)
+// If you use SendGrid/Mailgun/Resend/etc., wire it here.
+const EMAIL_PROVIDER = process.env.EMAIL_PROVIDER || 'resend'; // 'resend' | 'sendgrid' | 'mailgun' | 'none'
+const EMAIL_API_KEY = (process.env.EMAIL_API_KEY || '').trim();
+const EMAIL_FROM = (process.env.EMAIL_FROM || '').trim();
+const EMAIL_TO = (process.env.EMAIL_TO || '').trim();
 
-      - name: Run Job Automation Agent
-        env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          GMAIL_USER: ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          REPORT_EMAIL_RECIPIENT: ${{ secrets.REPORT_EMAIL_RECIPIENT }}
-          SMTP_HOST: smtp.gmail.com
-          SMTP_PORT: '587'
-          ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
-          ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
-          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
-        run: node scripts/run_workflow.js
+const profile = JSON.parse(fs.readFileSync(PROFILE_PATH, 'utf8'));
 
-      - name: Upload Reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: job-reports-${{ github.run_number }}
-          path: |
-            reports/
-            logs/
-          retention-days: 30
+[REPORT_DIR, LOG_DIR].forEach((dir) => fs.mkdirSync(dir, { recursive: true }));
+
+/** ----------------------------- utilities ----------------------------- */
+
+function sanitizeApiKey(key) {
+  // Remove characters that can break HTTP headers (control chars, non-ASCII)
+  // Keep visible ASCII (0x20-0x7E)
+  return String(key || '')
+    .split('')
+    .filter((ch) => {
+      const code = ch.charCodeAt(0);
+      return code >= 0x20 && code <= 0x7e;
+    })
+    .join('')
+    .trim();
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function ymd() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function log(level, message, data = {}) {
+  const entry = { timestamp: nowIso(), level, message, ...data };
+  const line = JSON.stringify(entry);
+  console.log(line);
+  fs.appendFileSync(path.join(LOG_DIR, `run_${ymd()}.log`), line + '\n');
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function stripHtml(html) {
+  return String(html || '')
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function safeText(x, maxLen = 600) {
+  const s = String(x || '').replace(/\s+/g, ' ').trim();
+  return s.length > maxLen ? s.slice(0, maxLen - 1) + '…' : s;
+}
+
+function fetchJSON(url, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const req = https.request(
+      {
+        method: 'GET',
+        hostname: u.hostname,
+        path: u.pathname + u.search,
+        headers: {
+          'User-Agent': opts.userAgent || 'JobBot/1.0',
+          Accept: 'application/json',
+          ...(opts.headers || {}),
+        },
+        timeout: opts.timeoutMs || 15000,
+      },
+      (res) => {
+        let data = '';
+        res.on('data', (chunk) => (data += chunk));
+        res.on('end', () => {
+          if (res.statusCode && res.statusCode >= 400) {
+            return reject(new Error(`HTTP ${res.statusCode} from ${url}: ${data.slice(0, 200)}`));
+          }
+          try {
+            resolve(JSON.parse(data));
+          } catch (e) {
+            reject(new Error(`Failed to parse JSON from ${url}: ${e.message}`));
+          }
+        });
+      }
+    );
+
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error(`Timeout: ${url}`));
+    });
+    req.end();
+  });
+}
+
+function postJSON(url, body, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const payload = JSON.stringify(body);
+    const req = https.request(
+      {
+        method: 'POST',
+        hostname: u.hostname,
+        path: u.pathname + u.search,
+        headers: {
+          'User-Agent': opts.userAgent || 'JobBot/1.0',
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(payload),
+          ...(opts.headers || {}),
+        },
+        timeout: opts.timeoutMs || 30000,
+      },
+      (res) => {
+        let data = '';
+        res.on('data', (chunk) => (data += chunk));
+        res.on('end', () => {
+          if (res.statusCode && res.statusCode >= 400) {
+            return reject(new Error(`HTTP ${res.statusCode} from ${url}: ${data.slice(0, 400)}`));
+          }
+          try {
+            resolve(JSON.parse(data));
+          } catch (e) {
+            // Some APIs may return empty body on 200/202
+            resolve({ raw: data });
+          }
+        });
+      }
+    );
+
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error(`Timeout: ${url}`));
+    });
+    req.write(payload);
+    req.end();
+  });
+}
+
+/** ----------------------------- job sources ---------------------------- */
+
+async function scrapeRemotive() {
+  try {
+    const query = encodeURIComponent(profile.desired_roles?.[0] || 'marketing');
+    const url = `https://remotive.com/api/remote-jobs?search=${query}&limit=50`;
+    const data = await fetchJSON(url);
+
+    const jobs = (data.jobs || []).map((job) => ({
+      source: 'Remotive',
+      title: job.title || '',
+      company: job.company_name || 'Unknown',
+      location: job.candidate_required_location || 'Remote',
+      url: job.url || '',
+      description: safeText(stripHtml(job.description || ''), 800),
+      tags: job.tags || [],
+      published_at: job.publication_date || '',
+    }));
+
+    log('info', `Remotive: scraped ${jobs.length} jobs`);
+    return jobs;
+  } catch (e) {
+    log('error', `Remotive failed: ${e.message}`);
+    return [];
+  }
+}
+
+async function scrapeTheMuse() {
+  try {
+    const query = encodeURIComponent(profile.desired_roles?.[0] || 'marketing');
+    const url = `https://www.themuse.com/api/public/jobs?category=${query}&page=1`;
+    const data = await fetchJSON(url);
+
+    const jobs = (data.results || []).map((job) => ({
+      source: 'TheMuse',
+      title: job.name || '',
+      company: job.company?.name || 'Unknown',
+      location: (job.locations || []).map((l) => l.name).join(', ') || 'Remote',
+      url: job.refs?.landing_page || '',
+      description: safeText(stripHtml(job.contents || ''), 800),
+      tags: (job.categories || []).map((c) => c.name),
+      published_at: job.publication_date || '',
+    }));
+
+    log('info', `TheMuse: scraped ${jobs.length} jobs`);
+    return jobs;
+  } catch (e) {
+    log('error', `TheMuse failed: ${e.message}`);
+    return [];
+  }
+}
+
+async function scrapeJobicy() {
+  try {
+    // Jobicy: https://jobicy.com/api/v2/remote-jobs
+    const query = encodeURIComponent(profile.desired_roles?.[0] || 'marketing');
+    const url = `https://jobicy.com/api/v2/remote-jobs?count=50&tag=${query}`;
+    const data = await fetchJSON(url);
+
+    const jobs = (data.jobs || []).map((job) => ({
+      source: 'Jobicy',
+      title: job.jobTitle || job.title || '',
+      company: job.companyName || 'Unknown',
+      location: job.jobGeo || 'Remote',
+      url: job.url || job.jobLink || '',
+      description: safeText(stripHtml(job.jobDescription || job.description || ''), 800),
+      tags: job.jobTags || [],
+      published_at: job.pubDate || '',
+    }));
+
+    log('info', `Jobicy: scraped ${jobs.length} jobs`);
+    return jobs;
+  } catch (e) {
+    log('error', `Jobicy failed: ${e.message}`);
+    return [];
+  }
+}
+
+// Stubs (reference placeholders)
+async function scrapeAdzuna() {
+  // Requires ADZUNA_APP_ID + ADZUNA_APP_KEY and country endpoint; implement as needed.
+  return [];
+}
+async function scrapeGreenhouse() {
+  // Requires list of company board tokens; implement as needed.
+  return [];
+}
+async function scrapeLever() {
+  // Requires list of company site slugs; implement as needed.
+  return [];
+}
+
+async function scrapeAllSources() {
+  const all = [];
+  const sources = [
+    scrapeRemotive,
+    scrapeTheMuse,
+    scrapeJobicy,
+    scrapeAdzuna,
+    scrapeGreenhouse,
+    scrapeLever,
+  ];
+
+  for (const fn of sources) {
+    try {
+      const jobs = await fn();
+      all.push(...jobs);
+      await sleep(250); // gentle pacing
+    } catch (e) {
+      log('error', `Source crashed: ${e.message}`, { source: fn.name });
+    }
+  }
+
+  // Basic de-dupe by URL/title/company
+  const seen = new Set();
+  const deduped = [];
+  for (const j of all) {
+    const k = `${(j.url || '').toLowerCase()}|${(j.title || '').toLowerCase()}|${(j.company || '').toLowerCase()}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    deduped.push(j);
+  }
+
+  log('info', `Total scraped jobs: ${all.length}, deduped: ${deduped.length}`);
+  return deduped;
+}
+
+/** ------------------------------ AI scoring ---------------------------- */
+
+function buildPrompt(job) {
+  const desired = (profile.desired_roles || []).join(', ');
+  const skills = [
+    ...(profile.skills?.marketing_and_gtm || []),
+    ...(profile.skills?.content_and_comms || []),
+    ...(profile.skills?.technical_domain || []),
+    ...(profile.skills?.software_and_tools || []),
+    ...(profile.skills?.soft_skills || []),
+  ].join(', ');
+
+  const exp = (profile.experience || [])
+    .map((e) => `${e.title} @ ${e.company} (${e.period}): ${e.highlights?.join('; ')}`)
+    .join('\n');
+
+  return [
+    `You are an applicant tracking assistant.`,
+    `Score this job for the candidate from 0 to 100.`,
+    `Return STRICT JSON ONLY with keys: score (number), reasons (array of strings), must_have_gaps (array of strings).`,
+    ``,
+    `Candidate:`,
+    `- Name: ${profile.name}`,
+    `- Location: ${profile.location}`,
+    `- Desired roles: ${desired}`,
+    `- Experience years: ${profile.experience_years}`,
+    `- Skills: ${skills}`,
+    `- Experience:\n${exp}`,
+    ``,
+    `Job:`,
+    `- Title: ${job.title}`,
+    `- Company: ${job.company}`,
+    `- Location: ${job.location}`,
+    `- Source: ${job.source}`,
+    `- URL: ${job.url}`,
+    `- Description: ${safeText(job.description, 1200)}`,
+  ].join('\n');
+}
+
+async function groqChatCompletion(prompt) {
+  if (!GROQ_API_KEY) {
+    throw new Error('GROQ_API_KEY missing');
+  }
+
+  const url = 'https://api.groq.com/openai/v1/chat/completions';
+  const body = {
+    model: GROQ_MODEL,
+    messages: [
+      { role: 'system', content: 'You are a precise JSON-only generator.' },
+      { role: 'user', content: prompt },
+    ],
+    temperature: 0.2,
+  };
+
+  const data = await postJSON(url, body, {
+    headers: {
+      Authorization: `Bearer ${GROQ_API_KEY}`,
+    },
+    timeoutMs: 45000,
+  });
+
+  const content = data?.choices?.[0]?.message?.content || '';
+  return String(content);
+}
+
+function tryParseJsonStrict(text) {
+  // Attempt to extract first JSON object in case model adds whitespace.
+  const s = String(text || '').trim();
+  const firstBrace = s.indexOf('{');
+  const lastBrace = s.lastIndexOf('}');
+  if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
+    throw new Error('No JSON object found in AI response');
+  }
+  const jsonStr = s.slice(firstBrace, lastBrace + 1);
+  return JSON.parse(jsonStr);
+}
+
+async function scoreJobsWithAI(jobs) {
+  const scored = [];
+  for (const job of jobs) {
+    try {
+      const prompt = buildPrompt(job);
+      const raw = await groqChatCompletion(prompt);
+      const parsed = tryParseJsonStrict(raw);
+
+      const score = Number(parsed.score);
+      if (!Number.isFinite(score)) throw new Error('AI score is not a number');
+
+      scored.push({
+        ...job,
+        ai_score: score,
+        ai_reasons: Array.isArray(parsed.reasons) ? parsed.reasons.slice(0, 6) : [],
+        ai_gaps: Array.isArray(parsed.must_have_gaps) ? parsed.must_have_gaps.slice(0, 6) : [],
+      });
+
+      log('info', 'Scored job', { title: job.title, company: job.company, score });
+      await sleep(300);
+    } catch (e) {
+      log('error', `AI scoring failed: ${e.message}`, { title: job.title, company: job.company, source: job.source });
+    }
+  }
+  return scored;
+}
+
+/** --------------------------- filtering/report ------------------------- */
+
+function passesFilters(job) {
+  const minScore = Number(profile.job_filters?.min_ai_score ?? 60);
+  const exclude = (profile.job_filters?.exclude_keywords || []).map((k) => String(k).toLowerCase());
+
+  const hay = `${job.title} ${job.company} ${job.description}`.toLowerCase();
+
+  if (Number.isFinite(minScore) && (job.ai_score ?? 0) < minScore) return false;
+
+  for (const k of exclude) {
+    if (k && hay.includes(k)) return false;
+  }
+
+  if (profile.job_filters?.require_remote) {
+    const loc = String(job.location || '').toLowerCase();
+    if (!loc.includes('remote')) return false;
+  }
+
+  return true;
+}
+
+function renderHtmlReport(scoredJobs) {
+  const top = [...scoredJobs].sort((a, b) => (b.ai_score || 0) - (a.ai_score || 0));
+  const rows = top
+    .map((j) => {
+      const reasons = (j.ai_reasons || []).map((r) => `<li>${escapeHtml(r)}</li>`).join('');
+      const gaps = (j.ai_gaps || []).map((g) => `<li>${escapeHtml(g)}</li>`).join('');
+      return `
+        <tr>
+          <td style="padding:10px;border-bottom:1px solid #eee;">
+            <div style="font-weight:600;">${escapeHtml(j.title)}</div>
+            <div style="color:#555;">${escapeHtml(j.company)} • ${escapeHtml(j.location)} • ${escapeHtml(j.source)}</div>
+            <div style="margin-top:6px;">
+              <a href="${escapeAttr(j.url)}" target="_blank" rel="noopener noreferrer">View job</a>
+            </div>
+          </td>
+          <td style="padding:10px;border-bottom:1px solid #eee;text-align:center;font-weight:700;">
+            ${Number.isFinite(j.ai_score) ? j.ai_score : '—'}
+          </td>
+          <td style="padding:10px;border-bottom:1px solid #eee;">
+            <div style="font-weight:600;">Why it fits</div>
+            <ul>${reasons || '<li>(none)</li>'}</ul>
+            <div style="font-weight:600;margin-top:8px;">Gaps</div>
+            <ul>${gaps || '<li>(none)</li>'}</ul>
+          </td>
+        </tr>
+      `.trim();
+    })
+    .join('\n');
+
+  return `
+  <html>
+    <body style="font-family:Arial, sans-serif;">
+      <h2>Daily Job Report (${escapeHtml(ymd())})</h2>
+      <p>Dry run: <b>${DRY_RUN ? 'true' : 'false'}</b></p>
+      <p>Candidate: ${escapeHtml(profile.name)} (${escapeHtml(profile.location)})</p>
+
+      <table style="border-collapse:collapse;width:100%;max-width:1100px;">
+        <thead>
+          <tr>
+            <th style="text-align:left;border-bottom:2px solid #ddd;padding:10px;">Job</th>
+            <th style="text-align:center;border-bottom:2px solid #ddd;padding:10px;width:90px;">Score</th>
+            <th style="text-align:left;border-bottom:2px solid #ddd;padding:10px;">Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows || '<tr><td colspan="3" style="padding:10px;">No matching jobs today.</td></tr>'}
+        </tbody>
+      </table>
+    </body>
+  </html>
+  `.trim();
+}
+
+function escapeHtml(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function escapeAttr(s) {
+  // For URL attributes; still do minimal escaping
+  return escapeHtml(s).replace(/`/g, '&#96;');
+}
+
+function writeReportFiles(payload) {
+  const base = `report_${ymd()}_${Date.now()}`;
+  const jsonPath = path.join(REPORT_DIR, `${base}.json`);
+  const htmlPath = path.join(REPORT_DIR, `${base}.html`);
+
+  fs.writeFileSync(jsonPath, JSON.stringify(payload, null, 2), 'utf8');
+  fs.writeFileSync(htmlPath, payload.html || '', 'utf8');
+
+  return { jsonPath, htmlPath };
+}
+
+/** ------------------------------ email -------------------------------- */
+
+async function sendEmailReport(subject, html) {
+  if (DRY_RUN) {
+    log('info', 'DRY_RUN enabled: skipping email send', { subject });
+    return { skipped: true };
+  }
+
+  if (!EMAIL_TO || !EMAIL_FROM) {
+    throw new Error('EMAIL_TO or EMAIL_FROM missing');
+  }
+
+  if (EMAIL_PROVIDER === 'none') {
+    log('info', 'EMAIL_PROVIDER=none: skipping email send', { subject });
+    return { skipped: true };
+  }
+
+  if (!EMAIL_API_KEY) {
+    throw new Error('EMAIL_API_KEY missing');
+  }
+
+  // Reference implementation for Resend (simple and popular)
+  if (EMAIL_PROVIDER === 'resend') {
+    const data = await postJSON(
+      'https://api.resend.com/emails',
+      {
+        from: EMAIL_FROM,
+        to: [EMAIL_TO],
+        subject,
+        html,
+      },
+      {
+        headers: { Authorization: `Bearer ${EMAIL_API_KEY}` },
+        timeoutMs: 30000,
+      }
+    );
+    return data;
+  }
+
+  throw new Error(`Unsupported EMAIL_PROVIDER: ${EMAIL_PROVIDER}`);
+}
+
+/** -------------------------------- main -------------------------------- */
+
+async function main() {
+  log('info', 'Job automation started', { dry_run: DRY_RUN });
+
+  const jobs = await scrapeAllSources();
+  if (!jobs.length) {
+    log('warn', 'No jobs scraped from sources.');
+  }
+
+  const scored = await scoreJobsWithAI(jobs);
+
+  const filtered = scored.filter(passesFilters);
+  filtered.sort((a, b) => (b.ai_score || 0) - (a.ai_score || 0));
+
+  const html = renderHtmlReport(filtered);
+
+  const payload = {
+    date: ymd(),
+    candidate: {
+      name: profile.name,
+      email: profile.email,
+      location: profile.location,
+      desired_roles: profile.desired_roles,
+    },
+    dry_run: DRY_RUN,
+    totals: {
+      scraped: jobs.length,
+      scored: scored.length,
+      matched: filtered.length,
+    },
+    jobs: filtered,
+    html,
+  };
+
+  const paths = writeReportFiles(payload);
+  log('info', 'Report written', paths);
+
+  const subject = `Daily Job Report - ${ymd()} (${filtered.length} matches)`;
+  const emailRes = await sendEmailReport(subject, html);
+  log('info', 'Email send result', { result: emailRes });
+
+  log('info', 'Job automation finished', { matched: filtered.length });
+}
+
+main().catch((e) => {
+  log('error', `Fatal: ${e.message}`, { stack: e.stack });
+  process.exitCode = 1;
+});
